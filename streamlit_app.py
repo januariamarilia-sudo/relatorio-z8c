@@ -1,8 +1,15 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import csv
 import json
+import re
+import unicodedata
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 import streamlit as st
 
@@ -32,11 +39,7 @@ def safe_code(value):
 
 
 DRAFT_CODE = safe_code(query_value("codigo", "principal"))
-SAVE_PATH = (
-    Path(__file__).with_name("relatorio_salvo.json")
-    if DRAFT_CODE == "principal"
-    else Path(__file__).with_name(f"relatorio_salvo_{DRAFT_CODE}.json")
-)
+LOCAL_SAVE_DIR = Path(__file__).with_name("relatorios_salvos")
 
 PRIORIDADES = ["", "Alta", "Media", "Baixa", "Urgente"]
 STATUS = [
@@ -452,7 +455,7 @@ def render_iphone_mode_hint():
             """
             <div class="iphone-card">
                 <strong>Para deixar como app na tela inicial:</strong>
-                <p>Abra este link no Safari do iPhone, toque em Compartilhar e escolha Adicionar à Tela de Início.</p>
+                <p>Abra este link no Safari do iPhone, toque em Compartilhar e escolha Adicionar Ã  Tela de InÃ­cio.</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -473,6 +476,108 @@ def clean(rows):
 
 def saved_now():
     return datetime.now().strftime("%d/%m/%Y %H:%M")
+
+
+def iso_now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def report_date_key(value=""):
+    value = " ".join(text_value(value).strip().split())
+    if not value:
+        return f"{DRAFT_CODE}:sem-data"
+    return f"{DRAFT_CODE}:{value.lower()}"
+
+
+def local_save_path(data_relatorio):
+    safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in data_relatorio)
+    return LOCAL_SAVE_DIR / f"{safe_name[:90] or 'sem-data'}.json"
+
+
+def secret_value(*names):
+    for name in names:
+        try:
+            value = st.secrets.get(name)
+        except Exception:
+            value = None
+        if value:
+            return str(value)
+        try:
+            section, key = name.split(".", 1)
+            value = st.secrets.get(section, {}).get(key)
+        except Exception:
+            value = None
+        if value:
+            return str(value)
+    return ""
+
+
+def supabase_config():
+    url = secret_value("SUPABASE_URL", "supabase.url").rstrip("/")
+    key = secret_value("SUPABASE_KEY", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY", "supabase.key", "supabase.anon_key")
+    if not url or not key:
+        return "", ""
+    return url, key
+
+
+def supabase_request(method, path, payload=None):
+    url, key = supabase_config()
+    if not url or not key:
+        raise RuntimeError("Supabase nao configurado.")
+    data = None
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Prefer"] = "resolution=merge-duplicates,return=representation"
+    request = Request(f"{url}/rest/v1/{path}", data=data, headers=headers, method=method)
+    with urlopen(request, timeout=12) as response:
+        text = response.read().decode("utf-8")
+    return json.loads(text) if text else None
+
+
+def load_remote_draft(data_relatorio):
+    encoded_date = quote(data_relatorio, safe="")
+    rows = supabase_request(
+        "GET",
+        f"relatorios?data_relatorio=eq.{encoded_date}&select=conteudo_json,atualizado_em&limit=1",
+    )
+    if not rows:
+        return None
+    draft = rows[0].get("conteudo_json")
+    if not isinstance(draft, dict):
+        return None
+    draft["saved_at"] = text_value(draft.get("saved_at") or rows[0].get("atualizado_em", ""))
+    return draft
+
+
+def save_remote_draft(data_relatorio, draft):
+    payload = {
+        "data_relatorio": data_relatorio,
+        "conteudo_json": draft,
+        "atualizado_em": iso_now(),
+    }
+    supabase_request("POST", "relatorios?on_conflict=data_relatorio", [payload])
+
+
+def load_local_draft(data_relatorio):
+    path = local_save_path(data_relatorio)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_local_draft(data_relatorio, draft):
+    LOCAL_SAVE_DIR.mkdir(exist_ok=True)
+    local_save_path(data_relatorio).write_text(json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def default_draft():
@@ -522,23 +627,163 @@ def blank_draft():
     }
 
 
-def load_draft():
-    if not SAVE_PATH.exists():
-        return default_draft()
+def load_draft(data_relatorio=None):
+    data_relatorio = data_relatorio or report_date_key("")
     try:
-        data = json.loads(SAVE_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default_draft()
-    if not isinstance(data, dict):
-        return default_draft()
-    return data
+        draft = load_remote_draft(data_relatorio)
+    except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError, OSError):
+        draft = load_local_draft(data_relatorio)
+    if not isinstance(draft, dict):
+        draft = default_draft()
+    return draft
 
 
-def save_draft(draft):
+def save_draft(draft, data_relatorio=None):
     draft = dict(draft)
     draft["saved_at"] = saved_now()
-    SAVE_PATH.write_text(json.dumps(draft, ensure_ascii=False, indent=2), encoding="utf-8")
+    data_relatorio = data_relatorio or report_date_key(draft.get("identity", {}).get("data", ""))
+    try:
+        save_remote_draft(data_relatorio, draft)
+        st.session_state["storage_mode"] = "Supabase"
+    except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError, OSError):
+        save_local_draft(data_relatorio, draft)
+        st.session_state["storage_mode"] = "local"
     return draft
+
+
+def normalize_lookup(value):
+    text = unicodedata.normalize("NFD", text_value(value))
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return " ".join(text.lower().split())
+
+
+def first_report_date(value):
+    match = re.search(r"\d{2}/\d{2}/\d{4}", text_value(value))
+    if not match:
+        return datetime.max
+    try:
+        return datetime.strptime(match.group(0), "%d/%m/%Y")
+    except ValueError:
+        return datetime.max
+
+
+def load_local_report_rows():
+    if not LOCAL_SAVE_DIR.exists():
+        return []
+    rows = []
+    for path in LOCAL_SAVE_DIR.glob("*.json"):
+        try:
+            draft = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(draft, dict):
+            continue
+        data_relatorio = report_date_key(draft.get("identity", {}).get("data", ""))
+        rows.append(
+            {
+                "data_relatorio": data_relatorio,
+                "conteudo_json": draft,
+                "atualizado_em": draft.get("saved_at", ""),
+            }
+        )
+    return rows
+
+
+def load_saved_report_rows():
+    try:
+        rows = supabase_request(
+            "GET",
+            "relatorios?select=data_relatorio,conteudo_json,atualizado_em&order=data_relatorio.asc&limit=1000",
+        )
+    except (HTTPError, URLError, TimeoutError, RuntimeError, json.JSONDecodeError, OSError):
+        rows = load_local_report_rows()
+    return rows if isinstance(rows, list) else []
+
+
+def build_activity_history(query, show_all=False):
+    query_norm = normalize_lookup(query)
+    if not query_norm and not show_all:
+        return []
+
+    entries = []
+    current_prefix = f"{DRAFT_CODE}:"
+    for record in load_saved_report_rows():
+        data_key = text_value(record.get("data_relatorio", ""))
+        if not data_key.startswith(current_prefix):
+            continue
+        draft = record.get("conteudo_json", {})
+        if not isinstance(draft, dict):
+            continue
+        data = text_value(draft.get("identity", {}).get("data", ""))
+        if not data and ":" in data_key:
+            data = data_key.split(":", 1)[1]
+
+        for row in draft.get("done", []) or []:
+            if not isinstance(row, dict):
+                continue
+            processo = text_value(row.get("processo", "")).strip()
+            atividade = text_value(row.get("atividade", "")).strip()
+            tempo = text_value(row.get("tempo", "")).strip()
+            status = text_value(row.get("status", "")).strip()
+            observacoes = text_value(row.get("observacoes", "")).strip()
+            if not any((processo, atividade, tempo, status, observacoes)):
+                continue
+
+            searchable = normalize_lookup(" ".join([processo, atividade, observacoes, status]))
+            if query_norm and query_norm not in searchable:
+                continue
+
+            entries.append(
+                {
+                    "Data": data,
+                    "Processo/assunto": processo,
+                    "Atividade executada": atividade,
+                    "Tempo": tempo,
+                    "Status": status,
+                    "Observacoes": observacoes,
+                }
+            )
+
+    entries.sort(key=lambda row: (first_report_date(row["Data"]), normalize_lookup(row["Processo/assunto"])))
+    return entries
+
+
+def history_csv(rows):
+    output = StringIO()
+    fieldnames = ["Data", "Processo/assunto", "Atividade executada", "Tempo", "Status", "Observacoes"]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, delimiter=";")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({name: row.get(name, "") for name in fieldnames})
+    return output.getvalue().encode("utf-8-sig")
+
+
+def render_consolidated_control():
+    with st.expander("Controle consolidado de atividades", expanded=False):
+        with st.form("historico_atividades_form"):
+            busca = st.text_input("Buscar processo/assunto", key="history_query", placeholder="Ex.: PL 40/2026")
+            mostrar_todas = st.checkbox("Mostrar todas as atividades executadas", key="history_show_all")
+            submitted = st.form_submit_button("Buscar atividades", use_container_width=True)
+
+        if submitted:
+            st.session_state["history_results"] = build_activity_history(busca, mostrar_todas)
+            st.session_state["history_searched"] = True
+
+        if st.session_state.get("history_searched"):
+            resultados = st.session_state.get("history_results", [])
+            if resultados:
+                datas = {row["Data"] for row in resultados if row.get("Data")}
+                st.success(f"{len(resultados)} atividade(s) encontrada(s) em {len(datas)} data(s).")
+                st.dataframe(resultados, use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Baixar controle em CSV",
+                    data=history_csv(resultados),
+                    file_name="controle_consolidado_atividades.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            else:
+                st.warning("Nenhuma atividade encontrada para esta busca.")
 
 
 def clear_item_fields(prefix):
@@ -626,13 +871,32 @@ def apply_draft(draft):
     st.session_state["last_saved_at"] = text_value(draft.get("saved_at", ""))
 
 
+def load_draft_for_current_date():
+    typed_date = st.session_state.get("identity_data", "")
+    data_relatorio = report_date_key(typed_date)
+    draft = load_draft(data_relatorio)
+    if text_value(typed_date).strip() and not text_value(draft.get("identity", {}).get("data", "")).strip():
+        draft.setdefault("identity", {})["data"] = typed_date
+    return data_relatorio, draft
+
+
 def init_state():
     if not st.session_state.get("draft_initialized"):
-        apply_draft(load_draft())
+        data_relatorio, draft = load_draft_for_current_date()
+        apply_draft(draft)
+        st.session_state["loaded_report_date"] = data_relatorio
         st.session_state["draft_initialized"] = True
+    else:
+        data_relatorio = report_date_key(st.session_state.get("identity_data", ""))
+        if data_relatorio != st.session_state.get("loaded_report_date"):
+            _, draft = load_draft_for_current_date()
+            apply_draft(draft)
+            st.session_state["loaded_report_date"] = data_relatorio
+            st.session_state["_feedback"] = "Rascunho desta data carregado."
     pending = st.session_state.pop("_pending_draft", None)
     if pending is not None:
         apply_draft(pending)
+        st.session_state["loaded_report_date"] = report_date_key(st.session_state.get("identity_data", ""))
     feedback = st.session_state.pop("_feedback", "")
     if feedback:
         st.success(feedback)
@@ -851,6 +1115,7 @@ def save_and_reload(draft, message):
     saved = save_draft(draft)
     st.session_state["_pending_draft"] = saved
     st.session_state["_feedback"] = message
+    st.session_state["loaded_report_date"] = report_date_key(saved.get("identity", {}).get("data", ""))
     st.rerun()
 
 
@@ -861,6 +1126,14 @@ def add_line_and_reload(count_key, message):
     current_count = int(st.session_state.get(count_key, 0))
     draft["counts"][count_key] = max(int(draft["counts"].get(count_key, 0)), current_count) + 1
     save_and_reload(draft, message)
+
+
+def auto_save_current_draft():
+    if not st.session_state.get("draft_initialized"):
+        return
+    draft = save_draft(current_draft())
+    st.session_state["last_saved_at"] = draft["saved_at"]
+    st.session_state["loaded_report_date"] = report_date_key(draft.get("identity", {}).get("data", ""))
 
 
 def render_draft_actions():
@@ -876,7 +1149,8 @@ def render_draft_actions():
         if st.button("Salvar rascunho", use_container_width=True):
             save_and_reload(current_draft(), "Rascunho salvo. Na proxima vez, o app abre deste ponto.")
     with c2:
-        if st.button("Limpar atividades diarias", use_container_width=True):
+        confirmar_limpeza = st.checkbox("Confirmo limpar somente as atividades diarias desta data.")
+        if st.button("Limpar atividades diarias", use_container_width=True, disabled=not confirmar_limpeza):
             draft = current_draft()
             draft["done"] = []
             draft["counts"]["done_count"] = 2
@@ -956,29 +1230,36 @@ def demand_options(planning_rows, extra_rows):
     return options
 
 
-def apply_done_prefill(new_rows):
+def apply_done_prefill(new_rows, current_rows=None):
     existing_rows = done_rows_from_state()
-    existing_processos = {
-        row.get("processo", "").strip().lower()
+    if not existing_rows and current_rows:
+        existing_rows = list(current_rows)
+    existing_pairs = {
+        (
+            row.get("processo", "").strip().lower(),
+            row.get("atividade", "").strip().lower(),
+        )
         for row in existing_rows
-        if row.get("processo", "").strip()
+        if row.get("processo", "").strip() or row.get("atividade", "").strip()
     }
     merged_rows = list(existing_rows)
 
     for row in new_rows:
         processo = row.get("processo", "").strip()
-        if not processo or processo.lower() in existing_processos:
+        atividade = row.get("atividade", "").strip()
+        pair = (processo.lower(), atividade.lower())
+        if (not processo and not atividade) or pair in existing_pairs:
             continue
         merged_rows.append(
             {
                 "processo": processo,
-                "atividade": row.get("atividade", ""),
+                "atividade": atividade,
                 "tempo": row.get("tempo", ""),
                 "status": row.get("status", "Em andamento"),
                 "observacoes": row.get("observacoes", ""),
             }
         )
-        existing_processos.add(processo.lower())
+        existing_pairs.add(pair)
 
     write_done_rows(merged_rows)
     remember_done_rows()
@@ -988,14 +1269,6 @@ def render_done(planning_rows, extra_rows):
     st.subheader("Atividades executadas")
     restore_done_rows_if_needed()
     options = [""] + demand_options(planning_rows, extra_rows)
-
-    if st.button("Puxar planejamento e demandas para executadas"):
-        rows = []
-        for row in planning_rows + extra_rows:
-            if row.get("processo"):
-                rows.append({"processo": row["processo"], "atividade": row.get("descricao", ""), "status": "Em andamento"})
-        apply_done_prefill(rows)
-        save_and_reload(current_draft(), "Demandas adicionadas sem apagar atividades executadas.")
 
     rows = []
     for idx in range(st.session_state.done_count):
@@ -1025,6 +1298,13 @@ def render_done(planning_rows, extra_rows):
                     "observacoes": obs.strip(),
                 }
             )
+    if st.button("Puxar planejamento e demandas para executadas", use_container_width=True):
+        prefill_rows = []
+        for row in planning_rows + extra_rows:
+            if row.get("processo") or row.get("descricao"):
+                prefill_rows.append({"processo": row.get("processo", ""), "atividade": row.get("descricao", ""), "status": "Em andamento"})
+        apply_done_prefill(prefill_rows, rows)
+        save_and_reload(current_draft(), "Demandas acrescentadas sem apagar as atividades existentes.")
     if st.button("Adicionar atividade executada"):
         add_line_and_reload("done_count", "Atividades salvas e nova linha aberta.")
     render_removed_items("done", "Atividade executada", st.session_state.done_count)
@@ -1037,6 +1317,7 @@ render_profile_links()
 render_iphone_mode_hint()
 init_state()
 render_draft_actions()
+render_consolidated_control()
 
 st.subheader("Identificacao")
 c1, c2, c3 = st.columns(3)
@@ -1084,6 +1365,8 @@ with c1:
 with c2:
     gerar = st.button("Gerar relatorio Word", type="primary", use_container_width=True)
 
+auto_save_current_draft()
+
 if gerar:
     draft = save_draft(current_draft())
     payload = {
@@ -1106,3 +1389,4 @@ if gerar:
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         type="primary",
     )
+

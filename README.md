@@ -1,4 +1,4 @@
-# relatorio-z8c
+﻿# relatorio-z8c
 
 Aplicativo Streamlit para gerar relatorios de produtividade em Word.
 
@@ -8,15 +8,27 @@ Aplicativo Streamlit para gerar relatorios de produtividade em Word.
 - `app.py`: motor que gera o `.docx`.
 - `modelo_relatorio.docx`: modelo Word usado como base.
 - `requirements.txt`: dependencias para o Streamlit instalar.
+- `supabase_relatorios.sql`: tabela permanente dos rascunhos.
+
+## Supabase
+
+Crie a tabela executando o conteudo de `supabase_relatorios.sql` no SQL Editor do Supabase.
+
+No Streamlit Community Cloud, abra as configuracoes do app e adicione os secrets:
+
+```toml
+SUPABASE_URL = "https://seu-projeto.supabase.co"
+SUPABASE_KEY = "sua-chave-anon-ou-service-role"
+```
+
+Quando esses secrets existem, o app salva cada data na tabela `relatorios`.
+Sem esses secrets, ele usa arquivos locais apenas para desenvolvimento.
 
 ## Publicar no Streamlit Community Cloud
 
-1. Crie um repositorio no GitHub chamado `relatorio-z8c`.
-2. Envie estes arquivos para o repositorio.
-3. Acesse `https://share.streamlit.io/`.
-4. Clique em **Create app**.
-5. Selecione o repositorio `relatorio-z8c`.
-6. Em **Main file path**, use `streamlit_app.py`.
-7. Clique em **Deploy**.
+1. Envie os arquivos para o repositorio `relatorio-z8c`.
+2. Acesse `https://share.streamlit.io/`.
+3. Selecione o repositorio `relatorio-z8c`.
+4. Em **Main file path**, use `streamlit_app.py`.
+5. Clique em **Deploy**.
 
-Depois disso, o Streamlit cria um link publico para acessar de qualquer computador.
